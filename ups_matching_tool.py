@@ -64,7 +64,7 @@ def compute_matches(shipment_df, account_df, threshold):
         top_scores = sims[top_idx]
         top_accounts = account_df.iloc[top_idx]
 
-        matched_account = "Cash"
+        matched_account = None
         suggestions = []
 
         for j, score in enumerate(top_scores):
@@ -72,9 +72,8 @@ def compute_matches(shipment_df, account_df, threshold):
             acc_num = top_accounts.iloc[j]['Account Number']
             if score >= threshold:
                 suggestions.append(f"{account_name} ({acc_num})")
-        
+
         if suggestions:
-            # Priority to account whose first 2 words match
             for j in top_idx:
                 acc_name = account_df.iloc[j]['Normalized Account']
                 acc_words = acc_name.split()[:2]
@@ -85,8 +84,10 @@ def compute_matches(shipment_df, account_df, threshold):
             else:
                 if sum(s >= threshold for s in top_scores) == 1:
                     matched_account = top_accounts.iloc[0]['Account Number']
+                else:
+                    matched_account = top_accounts.iloc[0]['Account Number']
 
-        if is_personal_name(recipient):
+        if matched_account is None or is_personal_name(recipient):
             matched_account = "Cash"
 
         results.append({
