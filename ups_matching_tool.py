@@ -13,7 +13,7 @@ st.set_page_config(page_title="UPS Australia Matching Tool", layout="wide")
 st.title("🇦🇺 UPS Australia Recipient Matching Tool")
 st.markdown("""
 Upload shipment and account Excel or CSV files. The tool will try to match recipient names to the correct account.
-- If no suggestions are found, it will default to 'Cash'.
+- Personal names will be treated as 'Cash', unless there are suggestions.
 - Up to 3 account suggestions per shipment.
 - Use filters to view only unmatched or only cash results.
 """)
@@ -64,19 +64,35 @@ def compute_matches(shipment_df, account_df, threshold):
         top_scores = sims[top_idx]
         top_accounts = account_df.iloc[top_idx]
 
+        matched_account = "Cash"
         suggestions = []
 
         for j, score in enumerate(top_scores):
+            account_name = top_accounts.iloc[j]['Account Name']
+            acc_num = top_accounts.iloc[j]['Account Number']
             if score >= threshold:
-                account_name = top_accounts.iloc[j]['Account Name']
-                acc_num = top_accounts.iloc[j]['Account Number']
                 suggestions.append(f"{account_name} ({acc_num})")
-
-        # Assign matched account based on suggestions
+        
         if suggestions:
-            matched_account = top_accounts.iloc[0]['Account Number']
-        else:
-            matched_account = "Cash"
+            # Priority to account whose first 2 words match
+            for j in top_idx:
+                acc_name = account_df.iloc[j]['Normalized Account']
+                acc_words = acc_name.split()[:2]
+                rec_words = recipient.split()[:2]
+                if acc_words == rec_words and sims[j] >= threshold:
+                    matched_account = account_df.iloc[j]['Account Number']
+                    break
+            else:
+                if sum(s >= threshold for s in top_scores) == 1:
+                    matched_account = top_accounts.iloc[0]['Account Number']
+
+        if is_personal_name(recipient):
+            if suggestions:
+                # Take first suggested account number if available
+                match = re.search(r"\((\w+)\)", suggestions[0])
+                matched_account = match.group(1) if match else "Cash"
+            else:
+                matched_account = "Cash"
 
         results.append({
             **row,
