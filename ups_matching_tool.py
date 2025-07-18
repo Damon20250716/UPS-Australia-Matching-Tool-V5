@@ -1,76 +1,114 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
+import difflib
+import base64
+import io
+import os
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import base64
+from PIL import Image
 
+st.set_page_config(layout="wide")
+
+# ---------- Helper functions ----------
 def normalize_name(name):
-    if pd.isna(name):
-        return ""
-    return ''.join(e for e in str(name).upper() if e.isalnum())
+    if not isinstance(name, str):
+        name = str(name)
+    return name.upper().strip()
 
-def match_recipient_to_account(recipient_name, account_df, vectorizer, threshold=0.7):
-    recipient_clean = normalize_name(recipient_name)
-    if not recipient_clean:
-        return "Cash", 0.0, [], "Empty recipient name"
+def is_personal_name(name):
+    name = normalize_name(name)
+    return (
+        len(name.split()) <= 3
+        and all(word.isalpha() for word in name.split())
+        and not any(x in name for x in ["PTY", "LTD", "CORP", "INC", "CO", "LIMITED"])
+    )
 
-    account_df['Normalized'] = account_df['Customer Name'].apply(normalize_name)
-    names = account_df['Normalized'].tolist()
-    tfidf_matrix = vectorizer.fit_transform([recipient_clean] + names)
-    cosine_scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
-    
-    account_df['Similarity'] = cosine_scores
-    sorted_df = account_df.sort_values(by='Similarity', ascending=False)
-    top_matches = sorted_df.head(3)
-    best_score = top_matches.iloc[0]['Similarity']
+def match_recipient_to_account_tfidf(recipient_name, acc_df, vectorizer, account_vectors, threshold):
+    recipient_name_cleaned = normalize_name(recipient_name)
+    if is_personal_name(recipient_name_cleaned):
+        return "Cash", 0, [], "Personal name"
+
+    recipient_vector = vectorizer.transform([recipient_name_cleaned])
+    similarities = cosine_similarity(recipient_vector, account_vectors).flatten()
+    best_indices = similarities.argsort()[::-1][:3]
+    suggestions = [(acc_df.iloc[i]['Customer Name'], similarities[i], acc_df.iloc[i]['Account Number']) for i in best_indices]
+
+    best_match_index = best_indices[0]
+    best_score = similarities[best_match_index]
+    best_name = acc_df.iloc[best_match_index]['Customer Name']
+    best_account = acc_df.iloc[best_match_index]['Account Number']
 
     if best_score >= threshold:
-        return top_matches.iloc[0]['Account Number'], best_score, top_matches[['Customer Name', 'Account Number', 'Similarity']].values.tolist(), "Matched"
-    return "Cash", best_score, top_matches[['Customer Name', 'Account Number', 'Similarity']].values.tolist(), "No match"
+        return best_account, best_score, suggestions, f"Matched with credit account"
+    else:
+        return "Cash", best_score, suggestions, "Below threshold"
 
-st.set_page_config(page_title="UPS AU Matching Tool", layout="wide")
-st.markdown("## 🇦🇺 UPS AU Recipient Matching Tool")
+def display_flag():
+    flag_path = "australia_flag.png"
+    if os.path.exists(flag_path):
+        st.image(flag_path, width=60)
+    else:
+        st.write(":flag-au:")
 
-shipment_file = st.file_uploader("Upload Shipment File (Excel or CSV)", type=["xlsx", "csv"])
-account_file = st.file_uploader("Upload Account List File (Excel or CSV)", type=["xlsx", "csv"])
-threshold = st.slider("Similarity Threshold", 0.5, 1.0, 0.75, 0.01)
-filter_option = st.selectbox("Filter results", ["All", "Only Cash", "Only Unmatched"])
+# ---------- Streamlit UI ----------
+st.title("UPS Australia Recipient Matching Tool")
+display_flag()
+
+shipment_file = st.file_uploader("Upload Shipment File (Excel or CSV)", type=["xlsx", "xls", "csv"])
+account_file = st.file_uploader("Upload Account List (Excel or CSV)", type=["xlsx", "xls", "csv"])
+threshold = st.slider("Similarity Threshold", min_value=0.1, max_value=1.0, value=0.75, step=0.01)
+
+filter_option = st.selectbox("Filter Results", ["All", "Only Unmatched (Cash)", "Only Matched (Credit)"])
 
 if shipment_file and account_file:
     try:
-        ship_df = pd.read_excel(shipment_file) if shipment_file.name.endswith(".xlsx") else pd.read_csv(shipment_file)
-        acc_df = pd.read_excel(account_file) if account_file.name.endswith(".xlsx") else pd.read_csv(account_file)
-        vectorizer = TfidfVectorizer().fit([])
+        shipment_df = pd.read_excel(shipment_file) if shipment_file.name.endswith("xlsx") else pd.read_csv(shipment_file)
+        acc_df = pd.read_excel(account_file) if account_file.name.endswith("xlsx") else pd.read_csv(account_file)
 
-        results = []
-        for _, row in ship_df.iterrows():
-            recipient = row.get('Recipient Company Name', '')
-            acct, score, suggestions, comment = match_recipient_to_account(recipient, acc_df.copy(), vectorizer, threshold)
-            results.append({
-                'Tracking Number': row.get('Tracking Number', ''),
-                'Recipient Company Name': recipient,
-                'Matched Account': acct,
-                'Score': score,
-                'Comment': comment,
-                'Suggestions': "; ".join([f"{s[0]} ({s[1]}) [{s[2]:.2f}]" for s in suggestions])
-            })
+        shipment_df['Recipient Company Name'] = shipment_df['Recipient Company Name'].astype(str).str.strip()
+        acc_df['Customer Name'] = acc_df['Customer Name'].astype(str).str.strip()
+        acc_df = acc_df[acc_df['Customer Name'].str.len() > 0]
 
-        result_df = pd.DataFrame(results)
-        if filter_option == "Only Cash":
-            result_df = result_df[result_df['Matched Account'] == "Cash"]
-        elif filter_option == "Only Unmatched":
-            result_df = result_df[result_df['Comment'] != "Matched"]
+        if acc_df.empty:
+            st.error("Account list is empty or invalid after cleaning. Please check your file.")
+            st.stop()
 
-        st.dataframe(result_df)
+        vectorizer = TfidfVectorizer(stop_words='english')
+        account_vectors = vectorizer.fit_transform(acc_df['Customer Name'])
 
-        if st.button("Download Result as Excel"):
-            result_path = "/mnt/data/ups_matching_result.xlsx"
-            result_df.to_excel(result_path, index=False, engine="xlsxwriter")
-            with open(result_path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
-                st.markdown(f'<a href="data:application/octet-stream;base64,{b64}" download="ups_matching_result.xlsx">📥 Click here to download result</a>', unsafe_allow_html=True)
+        matched_accounts = []
+        scores = []
+        comments = []
+        suggestions_all = []
+
+        for _, row in shipment_df.iterrows():
+            recipient = row['Recipient Company Name']
+            account, score, suggestions, comment = match_recipient_to_account_tfidf(recipient, acc_df, vectorizer, account_vectors, threshold)
+            matched_accounts.append(account)
+            scores.append(score)
+            comments.append(comment)
+            suggestions_all.append("; ".join([f"{x[0]} ({x[1]:.2f}) - {x[2]}" for x in suggestions]))
+
+        shipment_df['Matched Account'] = matched_accounts
+        shipment_df['Match Score'] = scores
+        shipment_df['Comment'] = comments
+        shipment_df['Top 3 Suggestions'] = suggestions_all
+
+        if filter_option == "Only Unmatched (Cash)":
+            shipment_df = shipment_df[shipment_df['Matched Account'] == "Cash"]
+        elif filter_option == "Only Matched (Credit)":
+            shipment_df = shipment_df[shipment_df['Matched Account'] != "Cash"]
+
+        st.dataframe(shipment_df)
+
+        # Excel export
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            shipment_df.to_excel(writer, index=False, sheet_name="Matching Result")
+            writer.save()
+        st.download_button("Download Result as Excel", data=output.getvalue(), file_name="matching_result.xlsx")
 
     except Exception as e:
-        st.error(f"❌ Error processing file: {e}")
+        st.error(f"❌ Error processing file: {str(e)}")
