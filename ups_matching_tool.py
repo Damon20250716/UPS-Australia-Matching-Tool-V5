@@ -1,119 +1,146 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import io
 import re
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from io import BytesIO
-import base64
+from PIL import Image
 
-# ---------- Display Header and Flag ----------
-def show_flag(country_code="au"):
-    st.image(f"https://flagcdn.com/w320/{country_code.lower()}.png", width=80)
+st.set_page_config(page_title="UPS Australia Matching Tool", layout="wide")
 
-st.set_page_config(page_title="UPS AU Matching Tool", layout="wide")
+# --- UI Header ---
 st.title("🇦🇺 UPS Australia Recipient Matching Tool")
-show_flag("au")
+st.markdown("""
+Upload shipment and account Excel or CSV files. The tool will try to match recipient names to the correct account.
+- Personal names will be treated as 'Cash'.
+- Up to 3 account suggestions per shipment.
+- Use filters to view only unmatched or only cash results.
+""")
 
-# ---------- Upload Section ----------
-shipment_file = st.file_uploader("Upload Shipment File (CSV)", type=["csv"])
-account_file = st.file_uploader("Upload Account List File (CSV)", type=["csv"])
-similarity_threshold = st.slider("Similarity Threshold", 0.5, 1.0, 0.85, step=0.01)
+# --- File Uploads ---
+shipment_file = st.file_uploader("📦 Upload Shipment File", type=['xlsx', 'csv'])
+account_file = st.file_uploader("🏢 Upload Account File", type=['xlsx', 'csv'])
+sim_threshold = st.slider("🔍 Similarity Threshold", 0.5, 1.0, 0.75, 0.01)
 
-# ---------- Normalize Function ----------
-def normalize(text):
-    if pd.isna(text): return ""
-    if isinstance(text, (int, float)): text = str(text)
-    text = text.upper()
-    text = re.sub(r'[^A-Z0-9 ]+', '', text)
-    return text.strip()
+@st.cache_data(show_spinner=False)
+def load_data(file):
+    if file.name.endswith(".csv"):
+        return pd.read_csv(file)
+    return pd.read_excel(file)
 
-# ---------- Check for personal name ----------
-def is_likely_personal(name):
-    if pd.isna(name): return True
-    name = name.upper()
-    if "PTY" in name or "LTD" in name or "CORP" in name or "CO" in name or "INC" in name:
-        return False
-    return len(name.split()) <= 2
+@st.cache_resource(show_spinner=False)
+def preprocess_text(s):
+    if pd.isna(s): return ""
+    if isinstance(s, (int, float)): s = str(s)
+    s = s.upper()
+    s = re.sub(r"[^A-Z0-9 ]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
-# ---------- Match Logic with TF-IDF ----------
-def match_shipments(shipments_df, accounts_df, threshold):
-    accounts_df["NormName"] = accounts_df["Customer Name"].apply(normalize)
-    shipment_names = shipments_df["Recipient Company Name"].fillna("").astype(str).apply(normalize)
+@st.cache_resource(show_spinner=False)
+def is_personal_name(name):
+    keywords = ["PTY", "LTD", "INC", "CORP", "CO", "LLC", "PLC"]
+    return not any(k in name for k in keywords) and len(name.split()) <= 4
 
-    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4))
-    tfidf_matrix = vectorizer.fit_transform(accounts_df["NormName"])
+@st.cache_resource(show_spinner=False)
+def compute_matches(shipment_df, account_df, threshold):
+    shipment_df['Normalized Recipient'] = shipment_df['Recipient Name'].apply(preprocess_text)
+    account_df['Normalized Account'] = account_df['Account Name'].apply(preprocess_text)
 
-    matched_accounts = []
-    similarity_scores = []
-    match_comments = []
+    tfidf = TfidfVectorizer(analyzer='char_wb', ngram_range=(2,4))
+    tfidf_matrix_accounts = tfidf.fit_transform(account_df['Normalized Account'])
+    tfidf_matrix_recipients = tfidf.transform(shipment_df['Normalized Recipient'])
 
-    for recipient in shipment_names:
-        if is_likely_personal(recipient):
-            matched_accounts.append("Cash")
-            similarity_scores.append(0)
-            match_comments.append("Likely personal name")
-            continue
+    similarities = cosine_similarity(tfidf_matrix_recipients, tfidf_matrix_accounts)
+    results = []
 
-        rec_vec = vectorizer.transform([recipient])
-        cosine_sim = cosine_similarity(rec_vec, tfidf_matrix).flatten()
-        top_idx = cosine_sim.argsort()[::-1][:3]
-        top_scores = cosine_sim[top_idx]
+    for i, row in shipment_df.iterrows():
+        recipient = row['Normalized Recipient']
+        original_name = row['Recipient Name']
+        sims = similarities[i]
 
-        if top_scores[0] >= threshold:
-            matched_account = accounts_df.iloc[top_idx[0]]["Account Number"]
-            matched_accounts.append(matched_account)
-            similarity_scores.append(top_scores[0])
-            comment = f"Matched with score {top_scores[0]:.2f}"
-        else:
-            matched_accounts.append("Cash")
-            similarity_scores.append(top_scores[0])
-            comment = "No good match found"
+        top_idx = np.argsort(sims)[::-1][:3]
+        top_scores = sims[top_idx]
+        top_accounts = account_df.iloc[top_idx]
 
-        match_comments.append(comment)
+        matched_account = "Cash"
+        suggestions = []
 
-    shipments_df["Matched Account"] = matched_accounts
-    shipments_df["Similarity Score"] = similarity_scores
-    shipments_df["Match Comment"] = match_comments
+        for j, score in enumerate(top_scores):
+            account_name = top_accounts.iloc[j]['Account Name']
+            acc_num = top_accounts.iloc[j]['Account Number']
+            if score >= threshold:
+                suggestions.append(f"{account_name} ({acc_num})")
+        
+        if suggestions:
+            # Priority to account whose first 2 words match
+            for j in top_idx:
+                acc_name = account_df.iloc[j]['Normalized Account']
+                acc_words = acc_name.split()[:2]
+                rec_words = recipient.split()[:2]
+                if acc_words == rec_words and sims[j] >= threshold:
+                    matched_account = account_df.iloc[j]['Account Number']
+                    break
+            else:
+                if sum(s >= threshold for s in top_scores) == 1:
+                    matched_account = top_accounts.iloc[0]['Account Number']
 
-    return shipments_df
+        if is_personal_name(recipient):
+            matched_account = "Cash"
 
-# ---------- Run Matching ----------
+        results.append({
+            **row,
+            "Matched Account": matched_account,
+            "Top Suggestions": "; ".join(suggestions)
+        })
+
+    return pd.DataFrame(results)
+
+# --- Main Logic ---
 if shipment_file and account_file:
     try:
-        shipments = pd.read_csv(shipment_file)
-        accounts = pd.read_csv(account_file)
+        shipment_df = load_data(shipment_file)
+        account_df = load_data(account_file)
 
-        if "Recipient Company Name" not in shipments.columns or "Customer Name" not in accounts.columns:
-            st.error("❌ Missing required columns in your files.")
+        if 'Recipient Name' not in shipment_df.columns or 'Account Name' not in account_df.columns:
+            st.error("❌ Please ensure 'Recipient Name' in shipment file and 'Account Name' in account file.")
         else:
-            matched_df = match_shipments(shipments.copy(), accounts.copy(), similarity_threshold)
+            with st.spinner("Matching in progress..."):
+                df = compute_matches(shipment_df, account_df, sim_threshold)
 
-            st.success(f"✅ Matching completed for {len(matched_df)} rows")
+            st.success(f"✅ Matching complete! {len(df)} rows processed.")
 
             # Filters
-            filter_option = st.selectbox("Filter", ["All", "Only Cash", "Only Unmatched"])
-            if filter_option == "Only Cash":
-                filtered_df = matched_df[matched_df["Matched Account"] == "Cash"]
-            elif filter_option == "Only Unmatched":
-                filtered_df = matched_df[matched_df["Similarity Score"] < similarity_threshold]
-            else:
-                filtered_df = matched_df
+            col1, col2 = st.columns(2)
+            with col1:
+                show_cash_only = st.checkbox("💵 Show Only 'Cash' Matches")
+            with col2:
+                show_unmatched_only = st.checkbox("🚫 Show Only Unmatched (Cash + No Suggestions)")
 
-            st.dataframe(filtered_df)
+            filtered_df = df.copy()
+            if show_cash_only:
+                filtered_df = filtered_df[filtered_df['Matched Account'] == 'Cash']
+            if show_unmatched_only:
+                filtered_df = filtered_df[(filtered_df['Matched Account'] == 'Cash') & (filtered_df['Top Suggestions'] == '')]
 
-            # Export to Excel
-            def to_excel(df):
-                output = BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    df.to_excel(writer, index=False, sheet_name='Matched Results')
-                return output.getvalue()
+            st.dataframe(filtered_df, use_container_width=True)
 
-            excel_data = to_excel(matched_df)
+            # Excel Export
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False, sheet_name='All Matches')
+                df[df['Matched Account'] == 'Cash'].to_excel(writer, index=False, sheet_name='Only Cash')
+                df[(df['Matched Account'] == 'Cash') & (df['Top Suggestions'] == '')].to_excel(writer, index=False, sheet_name='Only Unmatched')
 
-            b64 = base64.b64encode(excel_data).decode()
-            href = f'<a href="data:application/octet-stream;base64,{b64}" download="matched_results.xlsx">📥 Download Full Results as Excel</a>'
-            st.markdown(href, unsafe_allow_html=True)
+            st.download_button(
+                label="📥 Download Results as Excel",
+                data=output.getvalue(),
+                file_name="ups_matching_results.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
     except Exception as e:
         st.error(f"❌ Error processing file: {e}")
+else:
+    st.warning("⬆️ Please upload both shipment and account files to begin.")
